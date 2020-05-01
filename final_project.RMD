@@ -1,0 +1,637 @@
+---
+title: "Fast and furious boosting: a simulation study in proteomic variable selection and prediction"
+author: "Quinton Neville, qn2119"
+date: "4/26/2020"
+output: pdf_document
+header-includes: 
+  \usepackage{graphicx}
+  \usepackage{float}
+  \usepackage{amsmath}
+---
+
+```{r setup, include = FALSE, warning = FALSE, message = FALSE}
+#Set up all the good stuff
+library(tidyverse)
+library(simstudy)
+library(MCMCpack)
+library(DataExplorer)
+library(ggcorrplot)
+library(corrplot)
+library(broom)
+library(modelr)
+library(vip)
+library(gridExtra)
+library(caret)
+library(pROC)
+library(furrr)
+library(data.table)
+library(foreach)
+library(iterators)
+library(parallel)
+library(doParallel)
+#Set working directory
+knitr::opts_knit$set(root.dir = getwd())
+
+#Controlling figure output in markdown
+knitr::opts_chunk$set(
+#  fig.height =   
+  fig.width = 6,
+#  fig.asp = .5,
+  out.width = "90%",
+#  out.height = 
+ fig.align = "center",
+  cache = FALSE
+)
+
+#Set Theme for ggplot2
+theme_set(theme_bw() + theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom"))
+
+#Set Scientific notation output for knitr
+options(scipen = 999)
+```
+
+
+# 1. Simulation
+
+## 1.1 Proteomic Gene Expression Level Data Generation
+
+N observations = 50, 100, 500, 1000
+N vars = 100, 200, 500?
+Clusters = 1, 5, 10 ?
+Plan is to generate "groups" of correlated gamma rv's (1, 5, 10, 20), then generate a binary outcome based on 1, 2, 5, 10 signals (1 signal per cluster max) with a linear, quadratic, exponential, and "fill in the blank"
+
+```{r eval = FALSE}
+#Function to generate a correlated gamma cluster
+gamma_generator <- function(n_obs = 10, n_vars = 5, mean = 1, precision = 5, rho = 0.5, n_marker = 1) {
+  
+  #Generate random related mean and variance
+  mean      <- rep(mean, n_vars) + runif(n_vars, -mean/(mean + 1), mean/(mean + 1))
+  precision <- rep(precision, n_vars) + runif(n_vars, -precision/3, precision/3)
+  cor_mat   <- genCorMat(n_vars, cors = rep(rho, n_vars * (n_vars - 1)/2))
+  
+  #Return data as tibble
+  genCorGen(n_obs, n_vars, params1 = mean, params2 = precision, 
+            dis = "gamma", corMatrix = cor_mat, method = "copula",
+            cnames = str_c(sprintf("marker_%i_", n_marker), 1:n_vars), idname = "id", wide = TRUE) %>%
+    as_tibble()
+  
+  
+}
+
+#Check cors, all good! go from 0 - 0.9, based on real data very few negative
+gamma_generator(n_obs = 10, n_vars = 20, mean = 1, precision = 5, rho = 0.1) %>% dplyr::select(-id) %>% cor()
+
+#Testing Viz, all looks good. range mean (0, 1); precision (1, 2)
+gamma_generator(n_obs = 100, 
+                n_vars = 100,
+                mean = 1, 
+                precision = 2,
+                rho = 0.5) %>%
+  pivot_longer(-id, names_to = "marker", values_to = "expression") %>%
+  ggplot(aes(x = expression, colour = marker, fill = marker)) +
+  geom_density(alpha = 0.4, adjust = 0.8) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  scale_colour_viridis_d()# +
+ # xlim(c(0, 3))
+
+#Visualize correlation - looks good
+DataExplorer::plot_correlation(gamma_generator(n_obs = 100, 
+                                               n_vars = 25, 
+                                               mean = 1, 
+                                               precision = 2, 
+                                               rho = 0.1) %>%
+                               dplyr::select(-id),
+                               type = "continuous")
+
+prob_transform <- function(x) {
+  exp(x)/(1 + exp(x))
+}
+
+#Build data generator function
+#Set Params
+cluster_prop <- 1/5 #a rational number/divisor for clusters
+n_true_preds <- 5
+n_vars       <- 50
+p_threshold  <- c(0.4, 0.6)
+
+data_generator <- function(n_obs = 250, n_vars = 20, rho = 0.1, method = "linear") {
+  
+  #Check if valid inputs
+  if((rho < 0) | (rho > 1)) {stop("rho must be between (0, 1)")}
+
+  #Initialize Params
+  n_cluster  <- n_vars * cluster_prop
+  n_preds    <- (cluster_prop)^(-1)
+  #Randomize Mean and Precision
+  mean      <- seq(0.1, 1, length = n_cluster)
+  precision <- seq(1  , 2, length = n_cluster)
+  
+  #Generate predictors - Iterate, store as list, and join by id 
+  syn.df <- pmap(list(x = mean, y = precision, z = 1:n_cluster), 
+                 .f = function(x, y, z) {
+
+            gamma_generator(n_obs     = n_obs,
+                            n_vars    = n_preds,
+                            mean      = x, 
+                            precision = y,
+                            rho       = rho,
+                            n_marker  = z)
+         
+       }) %>% reduce(left_join, by = "id")
+  
+  #Label the data by one of linear, quadratic, non-linear
+  if(method %in% "linear") {
+      pred_sample <- sample(2:ncol(syn.df), n_true_preds)
+      prop_true   <- 0
+  while((prop_true < p_threshold[1]) | (prop_true > p_threshold[2])) {
+      beta_vec    <- runif(n_true_preds, -1, 1)
+  
+      syn.df <- syn.df %>%
+                mutate(
+                 down_syndrome = (as.matrix(.[,pred_sample]) %*% beta_vec),
+                 down_syndrome = prob_transform(down_syndrome) > 0.5
+                 )
+  
+      prop_true <- mean(syn.df$down_syndrome)
+    }
+  
+  
+  } else if(method %in% "quadratic") {
+    
+      pred_sample <- sample(2:ncol(syn.df), n_true_preds)
+      prop_true   <- 0
+      
+    while((prop_true < p_threshold[1]) | (prop_true > p_threshold[2])) {
+      
+      beta_vec    <- runif(n_true_preds * 2, -1, 1)
+  
+      syn.df <- syn.df %>%
+                mutate(
+                 down_syndrome = (as.matrix(.[,pred_sample])   %*% beta_vec[1:n_true_preds]) +
+                                 (as.matrix(.[,pred_sample])^2 %*% beta_vec[-c(1:n_true_preds)]),
+                 down_syndrome = prob_transform(down_syndrome) > 0.5
+                 )
+  
+      prop_true <- mean(syn.df$down_syndrome)
+    }
+    
+  } else if(method %in% "sinusoidal") {
+    
+      pred_sample <- sample(2:ncol(syn.df), n_true_preds)
+      prop_true   <- 0
+      
+    while((prop_true < p_threshold[1]) | (prop_true > p_threshold[2])) {
+      
+      beta_vec    <- runif(n_true_preds * 2 , -1, 1)
+  
+      syn.df <- syn.df %>%
+                mutate(
+                 down_syndrome = sin(as.matrix(.[,pred_sample]) %*% beta_vec[1:n_true_preds]) +
+                                 cos(as.matrix(.[,pred_sample]) %*% beta_vec[-c(1:n_true_preds)]),
+                 down_syndrome = prob_transform(down_syndrome) > 0.5
+                 )
+  
+      prop_true <- mean(syn.df$down_syndrome)
+    }
+    
+  }else if(method %in% "power") {
+    
+      pred_sample <- sample(2:ncol(syn.df), n_true_preds)
+      prop_true   <- 0
+      
+    while((prop_true < p_threshold[1]) | (prop_true > p_threshold[2])) {
+      
+      alpha_vec   <- runif(n_true_preds, 0, 1)
+      beta_vec    <- runif(n_true_preds, -1, 1)
+  
+      syn.df <- syn.df %>%
+                mutate(
+                 down_syndrome = (as.matrix(map2_df(.x = syn.df[,pred_sample],
+                                                    .y = alpha_vec,
+                                                    ~.x^(.y)))) %*% beta_vec,
+                 down_syndrome = prob_transform(down_syndrome) > 0.5
+                 )
+      
+      prop_true <- ifelse(is.nan(mean(syn.df$down_syndrome)), 0, mean(syn.df$down_syndrome))
+    }
+    
+  } else {
+  stop("Invalid method. Choose one of linear, quadratic, sinusoidal, or power.")
+  }
+  
+  return(syn.df %>% 
+         mutate(
+          down_syndrome = ifelse(down_syndrome == TRUE, "Yes", "No") %>%
+                          as.factor()
+        ) %>%
+        dplyr::select(id, down_syndrome, everything())
+  )
+     
+####Collect all the garbage     
+  gc()
+}
+
+#Test it out, all seems good!
+#data_generator(n_obs = 1000, n_vars = 100, rho = 0.5, method = "quadratic")
+```
+
+
+# 1.2 Generate the final data with parallel computing
+
+```{r}
+#Set Up Parallel Computing
+#Cores
+nCores   <- detectCores() - 1
+registerDoParallel(nCores)
+today <- Sys.Date() %>% str_replace_all("-", "_")
+
+#Function
+taskFun  <- data_generator
+
+#Set up grid for simulation
+sim_grid <- expand.grid(
+              n_obs  = c(250, 500, 1000),
+              n_vars = c(25, 50, 100),
+              rho    = seq(0.1, 0.9, by = 0.2),
+              method = c("linear", "quadratic", "sinusoidal", "power"),
+              stringsAsFactors = FALSE
+            )
+
+#100 X 10 = 1000 iterations
+null.return <- foreach(i = 1:nrow(sim_grid), 
+                       .packages = c("tidyverse", "simstudy", "data.table")) %dopar% {
+      
+        #Call function
+        outSub <- taskFun(n_obs  = sim_grid$n_obs[i],
+                          n_vars = sim_grid$n_vars[i],
+                          rho    = sim_grid$rho[i],
+                          method = sim_grid$method[i]
+                          )
+        #Save output
+        saveRDS(list(data = outSub, parameters = sim_grid[i, ]),
+                sprintf("./data/data_generation/%s_simulation_%i.RDS", today, i))
+} 
+
+```
+
+
+```{r}
+#Read in the simulated data to validate everything worked
+relative_path <- "./data/data_generation/"
+sim.df <- list.files(path = relative_path) %>%
+          enframe() %>%
+          rename(data_path  = value,
+                 simulation = name) %>%
+          mutate(
+            data_path = str_c(relative_path, "/", data_path),
+            input_files = map(.x = data_path, ~read_rds(.x)),
+            data        = input_files %>% map("data"),
+            parameters  = input_files %>% map("parameters")
+          ) %>%
+          dplyr::select(-c(data_path, input_files))
+
+#EDA just to check that everyhting is Kosher
+#Viz density of markers (SNP protein expression on log scale) - yup!
+sim.df$data[[4]] %>%
+pivot_longer(-c(id, down_syndrome), names_to = "marker", values_to = "expression") %>%
+  ggplot(aes(x = expression, colour = marker, fill = marker)) +
+  geom_density(alpha = 0.4, adjust = 0.8) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  scale_colour_viridis_d() +
+  xlim(c(0, 2))
+
+#Correlation - looks good!
+DataExplorer::plot_correlation(sim.df$data[[2]] %>%
+                               dplyr::select(-c(id, down_syndrome)),
+                               type = "continuous")
+sim.df$parameters[[2]]
+
+#Prop True - All good!
+map(.x = sim.df$data, ~.x$down_syndrome %>% table())
+
+#Check for any relationship between dist by outcome -looks a lil dif!
+sim.df$data[[4]] %>%
+pivot_longer(-c(id, down_syndrome), names_to = "marker", values_to = "expression") %>%
+  ggplot(aes(x = expression, colour = marker, fill = marker)) +
+  geom_density(alpha = 0.4, adjust = 0.8) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  scale_colour_viridis_d() +
+  xlim(c(0, 2)) +
+  facet_wrap(~down_syndrome)
+```
+
+# 2. Application - D.S. in Mice
+
+```{r}
+down.df <- read_csv("./data/mice_down_syndrome.csv") %>%
+  filter(!(MouseID %in% c("3426_13", "3426_14", "3426_15"))) %>%
+  dplyr::select( -c("BCL2_N","H3MeK4_N","BAD_N","EGR1_N","H3AcK18_N","pCFOS_N","Bcatenin_N","MEK_N","ELK_N")) %>%
+  janitor::clean_names() %>%
+  rename(
+    id = mouse_id,
+    down_syndrome = class
+  ) %>%
+  mutate(
+    down_syndrome = ifelse(down_syndrome == "Control", "No", "Yes") %>% as.factor() %>% fct_relevel("No", "Yes")
+  ) %>%
+  dplyr::select(id, down_syndrome, everything())
+```
+
+
+```{r fig.height = 6, fig.width = 6}
+#Plot Correlation structure, try to mimic with simulation
+
+introduce(down.df)
+DataExplorer::plot_correlation(down.df, type = "continuous")
+
+
+down.df %>%
+  gather(variable, value, -c(id, down_syndrome)) %>%
+  ggplot(aes(x = value, colour = variable, fill = variable)) +
+  geom_density(alpha = 0.4) +
+  theme(legend.position = "none") +
+  scale_fill_viridis_d() +
+  scale_colour_viridis_d() +
+  xlim(c(0, 3))
+
+sum.df <- down.df %>%
+  gather(variable, value, -c(id, down_syndrome)) %>%
+  group_by(variable) %>%
+  summarize(
+    mean = mean(value),
+    max  = max(value),
+    min  = min(value),
+    precision   = sd(value)^2 
+  )
+
+
+sum.df %>%
+  dplyr::select(mean) %>%
+  summary()
+
+sum.df %>%
+  dplyr::select(max) %>%
+  summary()
+
+sum.df %>%
+  dplyr::select(min) %>%
+  summary()
+
+sum.df %>%
+  dplyr::select(precision) %>%
+  summary()
+
+```
+
+
+# Test/Train
+```{r}
+#80% test train split
+set.seed(4)
+sample <- sample(1:nrow(down.df), round(nrow(down.df) * 0.8), replace = TRUE)
+
+train.df <- down.df[ ,-1] %>% slice(sample)
+test.df  <- down.df[ ,-1] %>% slice(-sample)
+
+#Check that test/train are comparable
+mean_abs_dif <- map2_dbl(.x = train.df,
+                         .y = test.df,
+                          ~abs(mean(.x) - mean(.y)))
+#nothing larger than an absolute mean diff of 0.05, good to go
+
+mean(train.df$down_syndrome == "Yes")
+mean(test.df$down_syndrome == "Yes")
+
+```
+
+
+# Training Diagnostics
+
+```{r eval = FALSE}
+#Set up tuning grids
+#Control
+control <- trainControl(method = "cv", 
+                        number = 5, 
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary)
+tree.depth <- floor(sqrt(nrow(train.df)))
+
+#Lasso
+lasso.grid <- expand.grid(alpha = 1,
+                          lambda = 10^seq(-5, -2, length = 50))
+#GBM - pretty quick tuning
+gbm.grid   <- expand.grid(
+              n.trees           = c(100, 250, 500),
+              interaction.depth = tree.depth,
+              shrinkage         = seq(0.05, 0.25, length = 20),
+              n.minobsinnode    = 10
+              )
+#ADA - little slower than GBM
+ada.grid   <- expand.grid(
+              iter     = c(100, 250, 500),
+              maxdepth = tree.depth,
+              nu       = seq(0.05, 0.25, length = 20)
+              )
+
+#XGlinear grid
+xgl.grid   <- expand.grid(
+              nrounds = c(100, 250, 500),
+              eta     = seq(0.05, 0.25, length = 5),
+              lambda  = seq(0, 0.5, by = 0.1),
+              alpha   = 1
+              )
+
+#XG Gradiant Tree
+xgt.grid  <- expand.grid(
+              nrounds   = c(100, 250),
+              max_depth = tree.depth,
+              eta       = seq(0.05, 0.5, by = 0.05),
+              gamma     = seq(0, 0.5, by = 0.1),
+              colsample_bytree = 1,
+              min_child_weight = 1,
+              subsample = 1)
+
+#Deep Boosting
+db.grid   <- expand.grid(
+              num_iter   = c(50, 100),
+              tree_depth = tree.depth,
+              lambda     = 10^seq(-3, -0.2, length = 10),
+              beta       = 10^seq(-3, 0.2, length = 10),
+              loss_type  = "e" 
+              )
+```
+
+```{r eval = FALSE}
+#Train models
+mod.lasso <- train(down_syndrome ~ ., 
+                   data = train.df, 
+                   method = "glmnet", 
+                   trControl = control, 
+                   metric = "ROC",
+                   tuneGrid = lasso.grid)
+
+mod.gbm   <- train(down_syndrome ~ ., 
+                    data = train.df, 
+                    method = "gbm", 
+                    trControl = control, 
+                    metric = "ROC", 
+                    tuneGrid = gbm.grid)
+
+mod.ada   <- train(down_syndrome ~ ., 
+                    data = train.df, 
+                    method = "ada", 
+                    trControl = control, 
+                    metric = "ROC", 
+                    tuneGrid = ada.grid)
+
+mod.xgl   <- train(down_syndrome ~ ., 
+                    data = train.df, 
+                    method = "xgbLinear", 
+                    trControl = control, 
+                    metric = "ROC", 
+                    tuneGrid = xgl.grid)
+
+mod.xgt   <- train(down_syndrome ~ ., 
+                    data = train.df, 
+                    method = "xgbTree", 
+                    trControl = control, 
+                    metric = "ROC", 
+                    tuneGrid = xgt.grid)
+
+mod.db    <- train(down_syndrome ~ ., 
+                    data = train.df, 
+                    method = "deepboost", 
+                    trControl = trainControl(method = "cv", 
+                                             number = 5, 
+                                             classProbs = FALSE), 
+                 #   metric = "Accuracy",
+                    tuneGrid = db.grid)
+#2 hours to run - limitation
+
+best.list <- list(glmnet       = mod.lasso,
+                  ada          = mod.ada,
+                  gbm          = mod.gbm,
+                  xgbLinear    = mod.xgl,
+                  xgbTree      = mod.xgt,
+                  deepboost    = mod.db
+                  ) %>%
+             map("bestTune")
+
+#Save Params for testing
+today <- Sys.Date() %>% str_replace_all("-", "_")
+#saveRDS(best.list, sprintf("./data/results/best_train_params_%s.RDS", today))
+
+#Deepboost 
+#ada trees
+#xgbLinear
+#xgbTree
+```
+
+
+#### Set up CV and/or bootstrap comparison (w/best params)
+```{r}
+#Read in param vals
+best.list <- readRDS("./data/results/best_train_params_deep_2020_04_28.RDS")
+#Function to fit all models
+fit_models <- function(param.list, train.df) {
+  
+  #Fit models (deepboost seperately)
+mod <-  c(map2(.x = names(param.list)[-6], .y = param.list[-6],
+          ~train(down_syndrome ~ ., 
+              data = train.df, 
+              method = .x, 
+              trControl = trainControl(method = "none",
+                                       classProbs = TRUE), 
+              metric = "ROC", 
+              tuneGrid = .y)),
+           list(train(down_syndrome ~ ., 
+              data = train.df, 
+              method = "deepboost", 
+              trControl = trainControl(method = "none",
+                                       classProbs = FALSE), 
+              tuneGrid = param.list$deepboost))
+          )
+#Give appropriate names
+names(mod) <- names(param.list)
+return(mod)     
+}
+
+#Test
+a <- Sys.time()
+test.fit <- fit_models(best.list, train.df)
+b <- Sys.time()
+(b - a) #47 seconds - not bad
+
+#Test Error
+map_dbl(.x = test.fit, ~mean(predict(.x, test.df) != test.df$down_syndrome))
+
+#Test Preds
+diagnose <- function(models, test.df) {
+ 
+  bind_rows(
+    error = c(map_dbl(.x = models, 
+                    ~mean(predict(.x, test.df) != test.df$down_syndrome)),
+              metric = "error"),
+    auc   = c(map_dbl(.x = models[-6], ~ predict(.x, test.df, type = "prob")[,2] %>%
+                              roc(test.df$down_syndrome, .) %>%
+                              auc()),
+              deepboost = NA,
+              metric    = "auc")
+  ) %>%
+    dplyr::select(metric, everything())
+  
+}
+
+#Test
+a <- Sys.time()
+diagnose(test.fit, test.df)
+b <- Sys.time()
+(b - a)
+
+#CV
+make_cv <- function(df, folds = 5) {
+  
+  crossv_kfold(df, k = folds) %>%
+  mutate(
+    train = map(train, as_tibble),
+    test  = map(test, as_tibble),
+  ) %>%
+  rename(id = .id) %>%
+  dplyr::select(id, everything())
+  
+}
+
+#Set Number
+set.seed(4)
+#future::plan(multiprocess)
+N <- 100
+start <- Sys.time()
+cv.df <- tibble(iteration = 1:N) %>%
+         mutate(
+           cv = map(.x = iteration, ~make_cv(train.df, 5))
+         ) %>% unnest(cols = cv) %>%
+ # slice(1:2) %>%
+  mutate(
+    models      = map(.x = train, ~fit_models(best.list, .x))) %>%
+  mutate(
+    diagnostics = map2(.x = models, .y = test,  ~diagnose(.x, .y))
+  )
+end <- Sys.time()
+(run.time <- end - start)
+
+#Save results
+result.df <- cv.df %>% dplyr::select(id, iteration, diagnostics) %>% unnest(diagnostics) %>% arrange(metric)
+
+#saveRDS(result.df, sprintf("./data/results/cv_res_%s.RDS", Sys.Date() %>% str_replace_all("-", "_")))
+
+```
+
+
+#### Set up Final test results (w/best params)
+```{r}
+
+
+```
