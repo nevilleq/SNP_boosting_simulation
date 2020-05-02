@@ -291,8 +291,8 @@ sim.df <- list.files(path = relative_path) %>%
             data        = input_files %>% map("data"),
             data        = map(.x = data, ~ .x %>% dplyr::select(-id)),
             parameters  = input_files %>% map("parameters"),
-            true_preds  = input_files %>% map("true_markers")
-            
+            true_preds  = input_files %>% map("true_markers"),
+            simulation  = as.factor(simulation)
           ) %>%
           dplyr::select(-c(data_path, input_files))
 
@@ -446,40 +446,174 @@ nCores   <- detectCores() - 1
 registerDoParallel(nCores)
 index <- c(178, 179, 180)
 #Here goes nothing
-map(.x = index, ~tune_models(sim.df$data[[.x]], .x))
+#map(.x = index, ~tune_models(sim.df$data[[.x]], .x))
 ```
 
 
-Parallelize and tune models, save optimal parameters for CV testing below.  
+Read in optimal parameters and run some CV diagnostics.
+
+```{r eval = FALSE}
+#Read in the best parameters
+relative_path <- "./data/results/sim_tuning_parameters/"
+param.df <- list.files(path = relative_path) %>%
+          enframe() %>%
+          rename(data_path  = value,
+                 simulation = name) %>%
+          mutate(
+            data_path   = str_c(relative_path, "/", data_path),
+            best_params = map(.x = data_path, ~read_rds(.x)),
+            simulation  = str_split_fixed(data_path, "_", 5)[,5] %>% parse_number(),
+            simulation  = as.factor(simulation)
+          ) %>%
+          dplyr::select(simulation, everything(), -data_path) %>%
+          arrange(simulation)
+
+#Read in the associated simulated data
+relative_path <- "./data/data_generation_2020_05_01/"
+sim.df <- list.files(path = relative_path) %>%
+          enframe() %>%
+          rename(data_path  = value,
+                 simulation = name) %>%
+          mutate(
+            data_path = str_c(relative_path, "/", data_path),
+            input_files = map(.x = data_path, ~read_rds(.x)),
+            data        = input_files %>% map("data"),
+            data        = map(.x = data, ~ .x %>% dplyr::select(-id)),
+            parameters  = input_files %>% map("parameters"),
+            true_preds  = input_files %>% map("true_markers"),
+            simulation  = as.factor(simulation)
+          ) %>%
+          dplyr::select(-c(data_path, input_files))
+          
+#Join for the final simulation data frame
+sim.df <- left_join(sim.df, param.df, by = "simulation")
+#glimpse(sim.df)
+```
+
+#### Diagnose models with CV by accuracy and ROC  
 
 ```{r}
-#Set Up Parallel Computing
-#Cores
-nCores   <- detectCores() - 1
-registerDoParallel(nCores)
-today <- Sys.Date() %>% str_replace_all("-", "_")
+#Set up tuning grids
+#Control
+control <- trainControl(method = "none", 
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        returnData = FALSE)
 
-#Function
-taskFun  <- tune_models
+db_control <- trainControl(method = "none", 
+                           classProbs = FALSE,
+                           returnData = FALSE)
 
-#100 X 10 = 1000 iterations
-null.return <- foreach(i = 1:2, 
-                       .packages = c("tidyverse", "caret", "gridExtra")) %dopar% {
-      
-        #Call function
-        outSub <- taskFun(sim.df$data[[i]], i)
+#Fit models
+fit_models <- function(data, parameter_list) {
+  
 
-} 
+  
+#Fit models (deepboost seperately)
+mod <-  c(map2(.x = names(parameter_list)[-6], .y = parameter_list[-6],
+          ~train(down_syndrome ~ ., 
+              data = data, 
+              method = .x, 
+              trControl = control, 
+              metric = "ROC", 
+              tuneGrid = .y)),
+           list(train(down_syndrome ~ ., 
+              data = data, 
+              method = "deepboost", 
+              trControl = db_control, 
+              tuneGrid = parameter_list$deepboost))
+          )
 
-remove(null.return)
-gc()
+#Give appropriate names
+names(mod) <- names(parameter_list)
+
+#Return models
+return(mod)
+
+#Collect all garbage and remove for efficient use of memory
+#gc()
+}
+
+#Test Preds
+diagnose <- function(models, test.df) {
+ 
+  bind_rows(
+    error = c(map_dbl(.x = models, 
+                    ~mean(predict(.x, test.df) != test.df$down_syndrome)),
+              metric = "error"),
+    auc   = c(map_dbl(.x = models[-6], ~ predict(.x, test.df, type = "prob")[,2] %>%
+                              roc(test.df$down_syndrome, .) %>%
+                              auc()),
+              deepboost = NA,
+              metric    = "auc")
+  ) %>%
+    dplyr::select(metric, everything())
+  
+}
+
+#CV
+make_cv <- function(df, n) {
+  
+  crossv_mc(df, n = n, test = 0.2) %>%
+  mutate(
+    train = map(train, as_tibble),
+    test  = map(test, as_tibble),
+  ) %>%
+  rename(id = .id) %>%
+  dplyr::select(id, everything())
+  
+}
+
+#Fit and diagnose each simulation with n 5-fold CV's 
+sim_diagnose <- function(data, best_params, n = 10, i = 1) {
+  
+  #Make CV replicates
+  cv.df <- make_cv(data, n)
+  
+  #Fit and diagnose each cv replicate, return data frame of results
+  map2_df(.x = cv.df$train, .y = cv.df$test,
+     ~fit_models(.x, best_params) %>%
+         diagnose(., .y) %>%
+         pivot_longer(-metric, names_to = "model", values_to = "value") %>%
+         mutate(value = as.numeric(value)) %>%
+         pivot_wider(values_from = "value", names_from = "model")
+        ) %>%
+  
+  saveRDS(., sprintf("./data/results/sim_cv_results/cv_result_%i.RDS", i))
+  
+}
+
+#Test, make sure it works - all bueno
+#Time it for 10
+#a <- Sys.time()
+#sim_diagnose(sim.df$data[[180]], sim.df$best_params[[180]], n = 5)
+#b <- Sys.time()
+#(b - a)
+#1.374909 mins for 10  for smallest data
+#6.335516 mins for 50
+
+#Set up furrr parallel computing
+plan(multiprocess) 
 
 
-#Check that it works, all good!
-read_rds("./data/results/sim_tuning_parameters/sim_params_2.RDS")
+future_map(.x = 1:nrow(sim.df), ~sim_diagnose(data = sim.df$data[[.x]], 
+                                   sim.df$best_params[[.x]],
+                                   n = 25,
+                                   i = .x
+                                   ))
+
+#Close connection\
+plan(sequential)
+
+#Check that it worked
+read_rds("./data/results/sim_cv_results/cv_result_180.RDS")
+
+
 
 
 ```
+
+
 
 # 2. Application - D.S. in Mice
 
@@ -546,7 +680,7 @@ sum.df %>%
 
 
 # Test/Train
-```{r}
+```{r eval = FALSE}
 #80% test train split
 set.seed(4)
 sample <- sample(1:nrow(down.df), round(nrow(down.df) * 0.8), replace = TRUE)
@@ -782,15 +916,119 @@ end <- Sys.time()
 (run.time <- end - start)
 
 #Save results
-result.df <- cv.df %>% dplyr::select(id, iteration, diagnostics) %>% unnest(diagnostics) %>% arrange(metric)
+#result.df <- cv.df %>% dplyr::select(id, iteration, diagnostics) %>% unnest(diagnostics) %>% arrange(metric)
 
 #saveRDS(result.df, sprintf("./data/results/cv_res_%s.RDS", Sys.Date() %>% str_replace_all("-", "_")))
-
 ```
 
 
-#### Set up Final test results (w/best params)
+#### Visualize and Summarize results
 ```{r}
+#Read and tidy
+result.df <- read_rds("./data/results/cv_results_final_2020_04_28.RDS") %>%
+
+result.long <- result.df %>%
+  pivot_longer(-c(id:metric), names_to = "model", values_to = "value", values_drop_na = TRUE) %>%
+  mutate(
+    value = as.numeric(value),
+    )
+
+# AUC
+#Box/violin
+auc.box.gg <- result.long %>%
+  filter(metric %in% "auc") %>%
+  mutate(
+    model = as.factor(model) %>%
+            fct_reorder(value, .desc = TRUE, .fun = mean)
+  )
+  ggplot(aes(x = model, y = value, fill = model, colour = model)) + 
+  geom_violin(trim = FALSE, alpha = 0.3) + 
+  geom_boxplot(width = 0.1, colour = "black", fill = "white", alpha = 0.1) +
+  labs(
+    y = "CV Area Under the ROC",
+    x = "Model",
+    title = "100 5-Fold CV AUC by Model"
+  ) +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model") +
+  ylim(c(0.98, 1.2))
+
+#Density, much better
+auc.dens.gg <- result.long %>%
+  filter(metric %in% "auc") %>%
+  mutate(
+    model = as.factor(model) %>%
+            fct_reorder(value, .desc = TRUE, .fun = mean)
+  ) %>%
+  ggplot(aes(x = value, fill = model, colour = model)) + 
+  geom_density(alpha = 0.3, adjust = 2, size = 1.2) + 
+  labs(
+    x = "CV Area Under the ROC",
+    y = "Density",
+    title = "100 5-Fold CV AUC by Model"
+  ) +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model") +
+  xlim(c(0.99, 1))
+
+#Save png
+#ggsave("./figures/mice/auc_density.png", auc.dens.gg)
 
 
+error.dens.gg <- result.long %>%
+  filter(metric %in% "error") %>%
+  mutate(
+    model = as.factor(model) %>%
+            fct_reorder(value, .desc = FALSE, .fun = mean)
+  ) %>%
+  ggplot(aes(x = value, fill = model, colour = model)) + 
+  geom_density(alpha = 0.3, adjust = 2, size = 1.2) + 
+  labs(
+    x = "CV Error",
+    y = "Density",
+    title = "100 5-Fold CV Error by Model"
+  ) +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model") +
+  guides(fill = guide_legend(nrow = 1),
+         colour = guide_legend(nrow = 1))
+
+#Save png
+#ggsave("./figures/mice/error_density.png", error.dens.gg)
+
+
+#Table of results
+res.table <- result.long %>%
+  group_by(model, metric) %>%
+  summarise(
+    mean = mean(value),
+    median = median(value),
+    variance = sd(value)^2
+  ) %>%
+  ungroup() %>%
+  mutate(model = as.factor(model) %>%
+                fct_reorder(mean, .desc = TRUE, .fun = max)) %>%
+  arrange(metric, model) %>%
+  knitr::kable(digits = 5)
+
+#kableExtra::save_kable(res.table, file = "./figures/mice/result_table_litera.png", bs_theme = "litera")
+
+
+#Final train/test results
+best.list <- readRDS("./data/results/best_train_params_deep_2020_04_28.RDS")
+final.result <- fit_models(best.list, train.df) %>% diagnose(., test.df) %>%
+                nest(-metric)
+
+
+final.kable <- final.result %>% 
+  pivot_longer(-metric, names_to = "model", values_to = "value") %>%
+  mutate(value = as.numeric(value)) %>%
+  pivot_wider(values_from = "value", names_from = "model") %>%
+  knitr::kable(digits = 5)
+
+kableExtra::save_kable(final.kable, file = "./figures/mice/final_test_train_table.png", bs_theme = "litera")
 ```
+
+
+
+
