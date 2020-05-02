@@ -220,13 +220,13 @@ data_generator <- function(n_obs = 250, n_vars = 20, rho = 0.1, method = "linear
   stop("Invalid method. Choose one of linear, quadratic, sinusoidal, or power.")
   }
   
-  return(syn.df %>% 
+  return(list(
+         data = syn.df %>% 
          mutate(
           down_syndrome = ifelse(down_syndrome == TRUE, "Yes", "No") %>%
-                          as.factor()
-        ) %>%
-        dplyr::select(id, down_syndrome, everything())
-  )
+                          as.factor()) %>%
+         dplyr::select(id, down_syndrome, everything()),
+         preds = pred_sample))
      
 ####Collect all the garbage     
   gc()
@@ -239,7 +239,7 @@ data_generator <- function(n_obs = 250, n_vars = 20, rho = 0.1, method = "linear
 
 # 1.2 Generate the final data with parallel computing
 
-```{r}
+```{r eval = FALSE}
 #Set Up Parallel Computing
 #Cores
 nCores   <- detectCores() - 1
@@ -251,7 +251,7 @@ taskFun  <- data_generator
 
 #Set up grid for simulation
 sim_grid <- expand.grid(
-              n_obs  = c(250, 500, 1000),
+              n_obs  = c(100, 250, 500),
               n_vars = c(25, 50, 100),
               rho    = seq(0.1, 0.9, by = 0.2),
               method = c("linear", "quadratic", "sinusoidal", "power"),
@@ -269,16 +269,18 @@ null.return <- foreach(i = 1:nrow(sim_grid),
                           method = sim_grid$method[i]
                           )
         #Save output
-        saveRDS(list(data = outSub, parameters = sim_grid[i, ]),
-                sprintf("./data/data_generation/%s_simulation_%i.RDS", today, i))
+        saveRDS(list(data = outSub$data, parameters = sim_grid[i, ], true_markers = outSub$preds),
+                sprintf("./data/data_generation_%s/simulation_%i.RDS", today, i))
 } 
 
+remove(null.return)
+gc()
 ```
 
 
 ```{r}
 #Read in the simulated data to validate everything worked
-relative_path <- "./data/data_generation/"
+relative_path <- "./data/data_generation_2020_05_01/"
 sim.df <- list.files(path = relative_path) %>%
           enframe() %>%
           rename(data_path  = value,
@@ -287,14 +289,17 @@ sim.df <- list.files(path = relative_path) %>%
             data_path = str_c(relative_path, "/", data_path),
             input_files = map(.x = data_path, ~read_rds(.x)),
             data        = input_files %>% map("data"),
-            parameters  = input_files %>% map("parameters")
+            data        = map(.x = data, ~ .x %>% dplyr::select(-id)),
+            parameters  = input_files %>% map("parameters"),
+            true_preds  = input_files %>% map("true_markers")
+            
           ) %>%
           dplyr::select(-c(data_path, input_files))
 
 #EDA just to check that everyhting is Kosher
 #Viz density of markers (SNP protein expression on log scale) - yup!
 sim.df$data[[4]] %>%
-pivot_longer(-c(id, down_syndrome), names_to = "marker", values_to = "expression") %>%
+pivot_longer(-down_syndrome, names_to = "marker", values_to = "expression") %>%
   ggplot(aes(x = expression, colour = marker, fill = marker)) +
   geom_density(alpha = 0.4, adjust = 0.8) +
   theme(legend.position = "none") +
@@ -304,7 +309,7 @@ pivot_longer(-c(id, down_syndrome), names_to = "marker", values_to = "expression
 
 #Correlation - looks good!
 DataExplorer::plot_correlation(sim.df$data[[2]] %>%
-                               dplyr::select(-c(id, down_syndrome)),
+                               dplyr::select(-down_syndrome),
                                type = "continuous")
 sim.df$parameters[[2]]
 
@@ -313,7 +318,7 @@ map(.x = sim.df$data, ~.x$down_syndrome %>% table())
 
 #Check for any relationship between dist by outcome -looks a lil dif!
 sim.df$data[[4]] %>%
-pivot_longer(-c(id, down_syndrome), names_to = "marker", values_to = "expression") %>%
+pivot_longer(-down_syndrome, names_to = "marker", values_to = "expression") %>%
   ggplot(aes(x = expression, colour = marker, fill = marker)) +
   geom_density(alpha = 0.4, adjust = 0.8) +
   theme(legend.position = "none") +
@@ -321,6 +326,159 @@ pivot_longer(-c(id, down_syndrome), names_to = "marker", values_to = "expression
   scale_colour_viridis_d() +
   xlim(c(0, 2)) +
   facet_wrap(~down_syndrome)
+```
+
+
+# 1.2.1
+Wrap the model fittings and cv results into one nice function  
+
+#### Tuning Grids  
+
+```{r}
+#Set up tuning grids
+#Control
+control <- trainControl(method = "cv", 
+                        number = 5, 
+                        classProbs = TRUE, 
+                        summaryFunction = twoClassSummary,
+                        returnData = FALSE)
+
+db_control <- trainControl(method = "cv", 
+                           number = 5, 
+                           classProbs = FALSE,
+                           returnData = FALSE)
+
+#List of tunings grids
+tune_list  <- function(data) {
+  
+tree.depth <- min(c(floor(sqrt(nrow(data))), 30)) #Max depth for ada boost (rpart)
+
+list(
+#Lasso
+glmnet     = expand.grid(alpha = 1,
+                          lambda = 10^seq(-5, -0.5, length = 40)),
+
+#ADA - little slower than GBM
+ada        =  expand.grid(
+              iter     = c(100, 250),
+              maxdepth = tree.depth,
+              nu       = seq(0.05, 0.25, length = 20)
+              ),
+
+#GBM - pretty quick tuning
+gbm        =  expand.grid(
+              n.trees           = c(100, 250),
+              interaction.depth = tree.depth,
+              shrinkage         = 10^seq(-2, -0.5, length = 20),
+              n.minobsinnode    = 10
+              ),
+
+#XGlinear grid
+xgbLinear  =  expand.grid(
+              nrounds = 250,
+              eta     = 10^seq(-2, -0.5, length = 5),
+              lambda  = 10^seq(-2, -0.5, length = 5),
+              alpha   = 1
+              ),
+
+#XG Gradiant Tree
+xgbTree    =  expand.grid(
+              nrounds   = c(100, 250),
+              max_depth = tree.depth,
+              eta       = 10^seq(-2, -0.5, length = 5),
+              gamma     = c(0, 0.05, 0.1),
+              colsample_bytree = 1,
+              min_child_weight = 1,
+              subsample = 1),
+
+#Deep Boosting
+deepboost  =  expand.grid(
+              num_iter   = 100,
+              tree_depth = tree.depth,
+              lambda     = 10^seq(-3, -0.5, length = 5),
+              beta       = 10^seq(-3, -0.5, length = 5),
+              loss_type  = "e" 
+              )
+    )
+}
+
+tune_models <- function(train.df, i) {
+  
+#Initialize tuning grids  
+tune_grid <- tune_list(train.df)
+  
+#Fit models (deepboost seperately)
+a <- Sys.time()
+mod <-  c(map2(.x = names(tune_grid)[-6], .y = tune_grid[-6],
+          ~train(down_syndrome ~ ., 
+              data = train.df, 
+              method = .x, 
+              trControl = control, 
+              metric = "ROC", 
+              tuneGrid = .y)),
+           list(train(down_syndrome ~ ., 
+              data = train.df, 
+              method = "deepboost", 
+              trControl = db_control, 
+              tuneGrid = tune_grid$deepboost))
+          )
+b <- Sys.time()
+#Display runtime and iteration
+print(b - a)
+print(i)
+#Give appropriate names
+names(mod) <- names(tune_grid)
+
+#Save for CV later
+saveRDS((mod %>% map("bestTune")), sprintf("./data/results/sim_tuning_parameters/sim_params_%i.RDS", i))
+
+#Collect all garbage and remove for efficient use of memory
+#gc()
+}
+
+#Test
+#tune_models(sim.df$data[[9]], 9)
+
+#Let her rip I guess haha 
+#Set Up Parallel Computing
+#Cores
+nCores   <- detectCores() - 1
+registerDoParallel(nCores)
+index <- c(178, 179, 180)
+#Here goes nothing
+map(.x = index, ~tune_models(sim.df$data[[.x]], .x))
+```
+
+
+Parallelize and tune models, save optimal parameters for CV testing below.  
+
+```{r}
+#Set Up Parallel Computing
+#Cores
+nCores   <- detectCores() - 1
+registerDoParallel(nCores)
+today <- Sys.Date() %>% str_replace_all("-", "_")
+
+#Function
+taskFun  <- tune_models
+
+#100 X 10 = 1000 iterations
+null.return <- foreach(i = 1:2, 
+                       .packages = c("tidyverse", "caret", "gridExtra")) %dopar% {
+      
+        #Call function
+        outSub <- taskFun(sim.df$data[[i]], i)
+
+} 
+
+remove(null.return)
+gc()
+
+
+#Check that it works, all good!
+read_rds("./data/results/sim_tuning_parameters/sim_params_2.RDS")
+
+
 ```
 
 # 2. Application - D.S. in Mice
@@ -416,7 +574,8 @@ mean(test.df$down_syndrome == "Yes")
 control <- trainControl(method = "cv", 
                         number = 5, 
                         classProbs = TRUE, 
-                        summaryFunction = twoClassSummary)
+                        summaryFunction = twoClassSummary,
+                        returnData = FALSE)
 tree.depth <- floor(sqrt(nrow(train.df)))
 
 #Lasso
