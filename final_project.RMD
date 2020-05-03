@@ -583,15 +583,6 @@ sim_diagnose <- function(data, best_params, n = 10, i = 1) {
   
 }
 
-#Test, make sure it works - all bueno
-#Time it for 10
-#a <- Sys.time()
-#sim_diagnose(sim.df$data[[180]], sim.df$best_params[[180]], n = 5)
-#b <- Sys.time()
-#(b - a)
-#1.374909 mins for 10  for smallest data
-#6.335516 mins for 50
-
 #Set up furrr parallel computing
 plan(multiprocess) 
 
@@ -604,12 +595,227 @@ future_map(.x = 1:nrow(sim.df), ~sim_diagnose(data = sim.df$data[[.x]],
 
 #Close connection\
 plan(sequential)
-
-#Check that it worked
-read_rds("./data/results/sim_cv_results/cv_result_180.RDS")
+```
 
 
+#### Visualize and Save Results
+```{r}
+#Read in the best parameters
+relative_path <- "./data/results/sim_cv_results/"
+cv.df  <- list.files(path = relative_path) %>%
+          enframe() %>%
+          rename(data_path  = value,
+                 simulation = name) %>%
+          mutate(
+            data_path   = str_c(relative_path, "/", data_path),
+            cv_results  = map(.x = data_path, ~read_rds(.x)),
+            simulation  = str_split_fixed(data_path, "_", 5)[,5] %>% parse_number(),
+            simulation  = as.factor(simulation)
+          ) %>%
+          dplyr::select(simulation, everything(), -data_path) %>%
+          arrange(simulation)
 
+#Read in the associated simulated data
+relative_path <- "./data/data_generation_2020_05_01/"
+sim.df <- list.files(path = relative_path) %>%
+          enframe() %>%
+          rename(data_path  = value,
+                 simulation = name) %>%
+          mutate(
+            data_path = str_c(relative_path, "/", data_path),
+            input_files = map(.x = data_path, ~read_rds(.x)),
+            data        = input_files %>% map("data"),
+            data        = map(.x = data, ~ .x %>% dplyr::select(-id)),
+            parameters  = input_files %>% map("parameters"),
+            true_preds  = input_files %>% map("true_markers"),
+            simulation  = as.factor(simulation)
+          ) %>%
+          dplyr::select(-c(data_path, input_files))
+
+#Working data and diagnostics
+sim.df <- left_join(sim.df, cv.df, by = "simulation")
+
+#Working long data for density viz
+res.long <- sim.df %>%
+            dplyr::select(parameters, cv_results) %>%
+            mutate(
+              cv_results = map(.x = cv_results,
+                               ~.x %>%
+                                 pivot_longer(-metric, 
+                                              names_to = "model", 
+                                              values_to = "value",
+                                              values_drop_na = TRUE)),
+              parameters  = map(.x = parameters, 
+                               ~.x %>% as_tibble())
+            ) %>% 
+            unnest(parameters:cv_results) %>%
+                        mutate(
+              method = as.factor(method) %>%
+                       fct_relevel("linear", "quadratic",
+                                   "sinusoidal", "power") %>%
+                       fct_recode("Linear"     = "linear",
+                                  "Quadratic"  = "quadratic",
+                                  "Sinusoidal" = "sinusoidal",
+                                  "Power"      = "power"),
+              model  = as.factor(model) %>%
+                       fct_relevel("glmnet", "xgbLinear",
+                                   "ada", "gbm", "xgbTree",
+                                   "deepboost"),
+              n_obs  = as.factor(n_obs) %>%
+                       fct_recode("100 Observations" = "100",
+                                  "250 Observations" = "250",
+                                  "500 Observations" = "500"),
+              n_vars = as.factor(n_vars) %>%
+                       fct_recode("25  SNP's" = "25",
+                                  "50  SNP's" = "50",
+                                  "100 SNP's" = "100")
+                       
+            )
+
+#Working long data with mean cv values
+res.mean <- sim.df %>%
+            dplyr::select(parameters, cv_results) %>%
+            mutate(
+              cv_results = map(.x = cv_results,
+                               ~.x %>%
+                                 pivot_longer(-metric, 
+                                              names_to = "model", 
+                                              values_to = "value",
+                                              values_drop_na = TRUE) %>%
+                                 group_by(metric, model) %>%
+                                 summarise(
+                                   mean     = mean(value),
+                                   variance = sd(value)^2 
+                                 ) %>% 
+                                 ungroup() %>%
+                                 mutate(
+                                   model  = as.factor(model)
+                                  )),
+              parameters  = map(.x = parameters, 
+                               ~.x %>% as_tibble())
+            ) %>% 
+            unnest(parameters:cv_results) %>%
+                        mutate(
+              method = as.factor(method) %>%
+                       fct_relevel("linear", "quadratic",
+                                   "sinusoidal", "power") %>%
+                       fct_recode("Linear"     = "linear",
+                                  "Quadratic"  = "quadratic",
+                                  "Sinusoidal" = "sinusoidal",
+                                  "Power"      = "power"),
+              model  = as.factor(model) %>%
+                       fct_relevel("glmnet", "xgbLinear",
+                                   "ada", "gbm", "xgbTree",
+                                   "deepboost"),
+              n_obs  = as.factor(n_obs) %>%
+                       fct_recode("100 Observations" = "100",
+                                  "250 Observations" = "250",
+                                  "500 Observations" = "500"),
+              n_vars = as.factor(n_vars) %>%
+                       fct_recode("25  SNP's" = "25",
+                                  "50  SNP's" = "50",
+                                  "100 SNP's" = "100")
+                       
+            )
+```
+
+#### Visualize Results
+
+```{r fig.height = 8, fig.width = 6}
+
+auc_ggplot <- function(obs_level) {
+  ggplot() +
+  geom_point(data = res.long %>%
+                    filter(metric %in% "auc") %>%
+                    filter(n_obs %in% obs_level),
+             aes(x = rho, y = value, colour = model, fill = model),
+             alpha = 0.08,
+             size = 0.8,
+             position = "jitter") +
+#  geom_line(data = res.mean %>%
+#                   filter(metric %in% "auc") %>%
+#                   filter(n_obs %in% "100 Observations"),
+#            aes(x = rho, y = mean, colour = model, fill = model),
+#            alpha = 0.6, 
+#            size = 1) +
+  stat_smooth(data = res.mean %>%
+                   filter(metric %in% "auc") %>%
+                   filter(n_obs %in% obs_level),
+            aes(x = rho, y = mean, colour = model, fill = model),
+            geom = "line",
+            alpha = 0.56, 
+            size = 1,
+            span = 1,
+            se = FALSE,
+            method = "loess") +
+  labs(
+    x = "Correlation",
+    y = "CV Mean Area Under the ROC",
+    title = "Model CV AUC by Correlation, Method, and SNP's"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, vjust = .5)) +
+  scale_x_continuous(breaks = seq(0, 1, by = .2)) +
+  facet_wrap(~method + n_vars, ncol = 3) +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model")
+}
+
+#Generate Grobs
+auc.gg.list <- map(.x = levels(res.mean$n_obs), ~auc_ggplot(.x))
+
+#Snag names in correct syntax
+obs.names <- levels(res.mean$n_obs) %>% str_replace_all(" ", "_") %>% str_replace_all("O", "o")
+
+#Save png
+map2(.x = auc.gg.list, .y = obs.names,
+     ~ggsave(sprintf("./figures/simulation/auc_%s.png", .y), .x))
+```
+
+```{r}
+error_ggplot <- function(obs_level) {
+  ggplot() +
+  geom_point(data = res.long %>%
+                    filter(metric %in% "error") %>%
+                    filter(n_obs %in% obs_level),
+             aes(x = rho, y = value, colour = model, fill = model),
+             alpha = 0.08,
+             size = 0.8,
+             position = "jitter") +
+#  geom_line(data = res.mean %>%
+#                   filter(metric %in% "auc") %>%
+#                   filter(n_obs %in% "100 Observations"),
+#            aes(x = rho, y = mean, colour = model, fill = model),
+#            alpha = 0.6, 
+#            size = 1) +
+  stat_smooth(data = res.mean %>%
+                   filter(metric %in% "error") %>%
+                   filter(n_obs %in% obs_level),
+            aes(x = rho, y = mean, colour = model, fill = model),
+            geom = "line",
+            alpha = 0.56, 
+            size = 1,
+            span = 1,
+            se = FALSE,
+            method = "loess") +
+  labs(
+    x = "Correlation",
+    y = "CV Error",
+    title = "Model CV Error by Correlation, Method, and SNP's"
+  ) +
+  facet_wrap(~method + n_vars, ncol = 3) +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model")
+}
+
+#Generate Grobs
+error.gg.list <- map(.x = levels(res.mean$n_obs), ~error_ggplot(.x))
+
+#Snag names in correct syntax
+obs.names <- levels(res.mean$n_obs) %>% str_replace_all(" ", "_") %>% str_replace_all("O", "o")
+
+#Save png
+map2(.x = error.gg.list, .y = obs.names,
+     ~ggsave(sprintf("./figures/simulation/error_%s.png", .y), .x))
 
 ```
 
