@@ -50,7 +50,7 @@ options(scipen = 999)
 ```
 
 
-# Appendix A.2 Code Documentation  
+# A.2 Code Documentation  
 
 ## 1. Simulation
 
