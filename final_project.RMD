@@ -1,7 +1,4 @@
 ---
-title: "Fast and furious boosting: a simulation study in proteomic variable selection and prediction"
-author: "Quinton Neville, qn2119"
-date: "4/26/2020"
 output: pdf_document
 header-includes: 
   \usepackage{graphicx}
@@ -29,6 +26,7 @@ library(foreach)
 library(iterators)
 library(parallel)
 library(doParallel)
+library(patchwork)
 #Set working directory
 knitr::opts_knit$set(root.dir = getwd())
 
@@ -40,7 +38,8 @@ knitr::opts_chunk$set(
   out.width = "90%",
 #  out.height = 
  fig.align = "center",
-  cache = FALSE
+  cache = FALSE,
+  eval  = FALSE
 )
 
 #Set Theme for ggplot2
@@ -51,14 +50,11 @@ options(scipen = 999)
 ```
 
 
-# 1. Simulation
+# Appendix A.2 Code Documentation  
 
-## 1.1 Proteomic Gene Expression Level Data Generation
+## 1. Simulation
 
-N observations = 50, 100, 500, 1000
-N vars = 100, 200, 500?
-Clusters = 1, 5, 10 ?
-Plan is to generate "groups" of correlated gamma rv's (1, 5, 10, 20), then generate a binary outcome based on 1, 2, 5, 10 signals (1 signal per cluster max) with a linear, quadratic, exponential, and "fill in the blank"
+### 1.1 SNP Expression Level Data Generation
 
 ```{r eval = FALSE}
 #Function to generate a correlated gamma cluster
@@ -237,7 +233,7 @@ data_generator <- function(n_obs = 250, n_vars = 20, rho = 0.1, method = "linear
 ```
 
 
-# 1.2 Generate the final data with parallel computing
+### 1.2 Generate Final Data With Parallel Computing
 
 ```{r eval = FALSE}
 #Set Up Parallel Computing
@@ -295,44 +291,12 @@ sim.df <- list.files(path = relative_path) %>%
             simulation  = as.factor(simulation)
           ) %>%
           dplyr::select(-c(data_path, input_files))
-
-#EDA just to check that everyhting is Kosher
-#Viz density of markers (SNP protein expression on log scale) - yup!
-sim.df$data[[4]] %>%
-pivot_longer(-down_syndrome, names_to = "marker", values_to = "expression") %>%
-  ggplot(aes(x = expression, colour = marker, fill = marker)) +
-  geom_density(alpha = 0.4, adjust = 0.8) +
-  theme(legend.position = "none") +
-  scale_fill_viridis_d() +
-  scale_colour_viridis_d() +
-  xlim(c(0, 2))
-
-#Correlation - looks good!
-DataExplorer::plot_correlation(sim.df$data[[2]] %>%
-                               dplyr::select(-down_syndrome),
-                               type = "continuous")
-sim.df$parameters[[2]]
-
-#Prop True - All good!
-map(.x = sim.df$data, ~.x$down_syndrome %>% table())
-
-#Check for any relationship between dist by outcome -looks a lil dif!
-sim.df$data[[4]] %>%
-pivot_longer(-down_syndrome, names_to = "marker", values_to = "expression") %>%
-  ggplot(aes(x = expression, colour = marker, fill = marker)) +
-  geom_density(alpha = 0.4, adjust = 0.8) +
-  theme(legend.position = "none") +
-  scale_fill_viridis_d() +
-  scale_colour_viridis_d() +
-  xlim(c(0, 2)) +
-  facet_wrap(~down_syndrome)
 ```
 
 
-# 1.2.1
-Wrap the model fittings and cv results into one nice function  
+### 1.3 Model Fitting
 
-#### Tuning Grids  
+#### 1.3.1 Parallel Model Tuning
 
 ```{r}
 #Set up tuning grids
@@ -436,21 +400,20 @@ saveRDS((mod %>% map("bestTune")), sprintf("./data/results/sim_tuning_parameters
 #gc()
 }
 
-#Test
-#tune_models(sim.df$data[[9]], 9)
-
 #Let her rip I guess haha 
 #Set Up Parallel Computing
 #Cores
 nCores   <- detectCores() - 1
 registerDoParallel(nCores)
-index <- c(178, 179, 180)
+index    <- 1:nrow(sim.df)
 #Here goes nothing
-#map(.x = index, ~tune_models(sim.df$data[[.x]], .x))
+map(.x = index, ~tune_models(sim.df$data[[.x]], .x))
 ```
 
 
-Read in optimal parameters and run some CV diagnostics.
+### 1.4 Simulation Diagnoistics
+
+#### 1.4.1 Read and Join Results  
 
 ```{r eval = FALSE}
 #Read in the best parameters
@@ -490,7 +453,7 @@ sim.df <- left_join(sim.df, param.df, by = "simulation")
 #glimpse(sim.df)
 ```
 
-#### Diagnose models with CV by accuracy and ROC  
+#### 1.4.2 Fit and Run Diagnostics
 
 ```{r}
 #Set up tuning grids
@@ -598,7 +561,8 @@ plan(sequential)
 ```
 
 
-#### Visualize and Save Results
+#### 1.4.3  Visualize and Save Results  
+
 ```{r}
 #Read in the best parameters
 relative_path <- "./data/results/sim_cv_results/"
@@ -719,11 +683,10 @@ res.mean <- sim.df %>%
             )
 ```
 
-#### Visualize Results
 
 ```{r fig.height = 8, fig.width = 6}
 
-auc_ggplot <- function(obs_level) {
+auc_ggplot <- function(obs_level, y_lower) {
   ggplot() +
   geom_point(data = res.long %>%
                     filter(metric %in% "auc") %>%
@@ -732,12 +695,6 @@ auc_ggplot <- function(obs_level) {
              alpha = 0.08,
              size = 0.8,
              position = "jitter") +
-#  geom_line(data = res.mean %>%
-#                   filter(metric %in% "auc") %>%
-#                   filter(n_obs %in% "100 Observations"),
-#            aes(x = rho, y = mean, colour = model, fill = model),
-#            alpha = 0.6, 
-#            size = 1) +
   stat_smooth(data = res.mean %>%
                    filter(metric %in% "auc") %>%
                    filter(n_obs %in% obs_level),
@@ -751,8 +708,11 @@ auc_ggplot <- function(obs_level) {
   labs(
     x = "Correlation",
     y = "CV Mean Area Under the ROC",
-    title = "Model CV AUC by Correlation, Method, and SNP's"
+    title = sprintf("Model CV AUC by Correlation, Method, and SNP's (N = %i)", 
+                     obs_level %>% parse_number())
   ) +
+  scale_y_continuous(breaks = seq(y_lower, 1, by = 0.05),
+                     limits = c(y_lower, 1)) +
   theme(axis.text.x = element_text(angle = 45, vjust = .5)) +
   scale_x_continuous(breaks = seq(0, 1, by = .2)) +
   facet_wrap(~method + n_vars, ncol = 3) +
@@ -761,7 +721,7 @@ auc_ggplot <- function(obs_level) {
 }
 
 #Generate Grobs
-auc.gg.list <- map(.x = levels(res.mean$n_obs), ~auc_ggplot(.x))
+auc.gg.list <- map2(.x = levels(res.mean$n_obs), .y = c(0.7, 0.85, 0.9), ~auc_ggplot(.x, .y))
 
 #Snag names in correct syntax
 obs.names <- levels(res.mean$n_obs) %>% str_replace_all(" ", "_") %>% str_replace_all("O", "o")
@@ -772,7 +732,7 @@ map2(.x = auc.gg.list, .y = obs.names,
 ```
 
 ```{r}
-error_ggplot <- function(obs_level) {
+error_ggplot <- function(obs_level, y_upper) {
   ggplot() +
   geom_point(data = res.long %>%
                     filter(metric %in% "error") %>%
@@ -781,12 +741,6 @@ error_ggplot <- function(obs_level) {
              alpha = 0.08,
              size = 0.8,
              position = "jitter") +
-#  geom_line(data = res.mean %>%
-#                   filter(metric %in% "auc") %>%
-#                   filter(n_obs %in% "100 Observations"),
-#            aes(x = rho, y = mean, colour = model, fill = model),
-#            alpha = 0.6, 
-#            size = 1) +
   stat_smooth(data = res.mean %>%
                    filter(metric %in% "error") %>%
                    filter(n_obs %in% obs_level),
@@ -800,15 +754,18 @@ error_ggplot <- function(obs_level) {
   labs(
     x = "Correlation",
     y = "CV Error",
-    title = "Model CV Error by Correlation, Method, and SNP's"
+    title = sprintf("Model CV Error by Correlation, Method, and SNP's (N = %i)",
+                    obs_level %>% parse_number())
   ) +
+  scale_y_continuous(breaks = seq(0, y_upper, by = 0.1),
+                     limits = c(0, y_upper)) +
   facet_wrap(~method + n_vars, ncol = 3) +
   scale_colour_viridis_d("Model") +
   scale_fill_viridis_d("Model")
 }
 
 #Generate Grobs
-error.gg.list <- map(.x = levels(res.mean$n_obs), ~error_ggplot(.x))
+error.gg.list <- map2(.x = levels(res.mean$n_obs), .y = c(0.4, 0.3, 0.2), ~error_ggplot(.x, .y))
 
 #Snag names in correct syntax
 obs.names <- levels(res.mean$n_obs) %>% str_replace_all(" ", "_") %>% str_replace_all("O", "o")
@@ -816,13 +773,41 @@ obs.names <- levels(res.mean$n_obs) %>% str_replace_all(" ", "_") %>% str_replac
 #Save png
 map2(.x = error.gg.list, .y = obs.names,
      ~ggsave(sprintf("./figures/simulation/error_%s.png", .y), .x))
+```
 
+
+#### 1.4.4 Correlation example for paper
+```{r}
+sim.cor <- sim.df$data[[20]] %>%
+  DataExplorer::plot_correlation(., type = "continuous",
+                                 title = "Correlation of 100 Synthetic SNP Expression Levels (N = 250, rho = 0.5",
+                                 theme_config = list(
+                                   axis.text.x = element_blank(),
+                                   axis.text.y = element_blank(),
+                                   plot.title  = element_text(hjust = 0.5)),
+                                 ggtheme = theme_bw())
+
+
+sim.dens <- sim.df$data[[2]] %>%
+  gather(variable, value, -down_syndrome) %>%
+  ggplot(aes(x = value, colour = variable, fill = variable)) +
+  geom_density(alpha = 0.3) +
+  theme(legend.position = "none") +
+  labs(
+    x = "SNP Expression Level",
+    y = "Density",
+    title = "25 Synthetic SNP Levels by Marker"
+  ) +
+  scale_fill_viridis_d() +
+  scale_colour_viridis_d() +
+  xlim(c(0, 2))
 ```
 
 
 
-# 2. Application - D.S. in Mice
+# 2. Down Syndrome in Mice Application
 
+## 2.1 Data Read and Clean
 ```{r}
 down.df <- read_csv("./data/mice_down_syndrome.csv") %>%
   filter(!(MouseID %in% c("3426_13", "3426_14", "3426_15"))) %>%
@@ -839,21 +824,36 @@ down.df <- read_csv("./data/mice_down_syndrome.csv") %>%
 ```
 
 
+### 2.1.1 Exploration  
 ```{r fig.height = 6, fig.width = 6}
 #Plot Correlation structure, try to mimic with simulation
+mice.cor <- DataExplorer::plot_correlation(down.df, type = "continuous",
+                               title = "Correlation of 68 Mice SNP Expression Levels",
+                               theme_config = list(
+                                 axis.text.x = element_blank(),
+                                 axis.text.y = element_blank(),
+                                 plot.title  = element_text(hjust = 0.5)),
+                               ggtheme = theme_bw())
 
-introduce(down.df)
-DataExplorer::plot_correlation(down.df, type = "continuous")
+ggsave("./figures/mice/snp_correlation.png", mice.cor)
 
-
-down.df %>%
+mice.dens <- down.df %>%
   gather(variable, value, -c(id, down_syndrome)) %>%
   ggplot(aes(x = value, colour = variable, fill = variable)) +
   geom_density(alpha = 0.4) +
   theme(legend.position = "none") +
+  labs(
+    x = "SNP Expression Level",
+    y = "Density",
+    title = "68 Mice SNP Levels by Marker"
+  ) +
   scale_fill_viridis_d() +
   scale_colour_viridis_d() +
-  xlim(c(0, 3))
+  xlim(c(0, 2))
+
+dens.join <- (mice.dens + sim.dens)
+
+ggsave("./figures/mice/density_example.png", dens.join)
 
 sum.df <- down.df %>%
   gather(variable, value, -c(id, down_syndrome)) %>%
@@ -885,7 +885,8 @@ sum.df %>%
 ```
 
 
-# Test/Train
+### 2.1.2 Test/Train Split  
+
 ```{r eval = FALSE}
 #80% test train split
 set.seed(4)
@@ -906,7 +907,7 @@ mean(test.df$down_syndrome == "Yes")
 ```
 
 
-# Training Diagnostics
+## 2.2 Model Tuning/Fitting  
 
 ```{r eval = FALSE}
 #Set up tuning grids
@@ -1022,15 +1023,12 @@ best.list <- list(glmnet       = mod.lasso,
 #Save Params for testing
 today <- Sys.Date() %>% str_replace_all("-", "_")
 #saveRDS(best.list, sprintf("./data/results/best_train_params_%s.RDS", today))
-
-#Deepboost 
-#ada trees
-#xgbLinear
-#xgbTree
 ```
 
 
-#### Set up CV and/or bootstrap comparison (w/best params)
+## 2.3 Model Diagnostics  
+
+
 ```{r}
 #Read in param vals
 best.list <- readRDS("./data/results/best_train_params_deep_2020_04_28.RDS")
@@ -1128,10 +1126,11 @@ end <- Sys.time()
 ```
 
 
-#### Visualize and Summarize results
-```{r}
+## 2.4 Visualize and Summarize Results  
+
+```{r fig.width = 6, fig.height = 4}
 #Read and tidy
-result.df <- read_rds("./data/results/cv_results_final_2020_04_28.RDS") %>%
+result.df <- read_rds("./data/results/cv_results_final_2020_04_28.RDS")
 
 result.long <- result.df %>%
   pivot_longer(-c(id:metric), names_to = "model", values_to = "value", values_drop_na = TRUE) %>%
@@ -1199,8 +1198,32 @@ error.dens.gg <- result.long %>%
   guides(fill = guide_legend(nrow = 1),
          colour = guide_legend(nrow = 1))
 
+auc.error.dens.gg <- result.long %>%
+  mutate(
+    metric = as.factor(metric) %>%
+             fct_recode("Error" = "error", "AUC" = "auc") %>%
+             fct_relevel("Error", "AUC"),
+    model  = as.factor(model) %>%
+             fct_relevel("gbm", "ada", "xgbTree", "deepboost", "xgbLinear", "glmnet")
+  ) %>%
+  ggplot(aes(x = value, fill = model, colour = model)) + 
+  geom_density(alpha = 0.3, adjust = 2, size = 1.2) + 
+  labs(
+    x = "CV Error",
+    y = "Density",
+    title = "100 5-Fold CV Error by Model"
+  ) +
+  scale_colour_viridis_d("Model") +
+  scale_fill_viridis_d("Model") +
+  guides(fill = guide_legend(nrow = 1),
+         colour = guide_legend(nrow = 1)) +
+  facet_wrap(~metric, scales = "free")
+
 #Save png
 #ggsave("./figures/mice/error_density.png", error.dens.gg)
+
+#mice.final.dens <- (error.dens.gg + auc.dens.gg)
+ggsave("./figures/mice/error_and_auc_density.png", auc.error.dens.gg)
 
 
 #Table of results
